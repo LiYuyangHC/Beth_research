@@ -1,0 +1,20 @@
+# ── Credentials — NEVER commit ──────────────────────
+config.py
+
+# ── Generated files ──────────────────────────────────
+data/
+output/
+
+# ── Planet pipeline intermediates ────────────────────
+*.npy
+*.tif
+
+# ── Python ───────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# ── OS ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
