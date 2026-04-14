@@ -12,8 +12,11 @@ planet_password = 'xxxxxxxxxxxxxxxxxxxxxxxxx' #place your Planet password
 # Options: 'gauge_1' through 'gauge_10'
 GAUGE_ID = 'gauge_1'
  
-# Path to the gauges CSV (sits next to this config file)
-GAUGES_CSV = Path(__file__).parent / 'gauges.csv'
+# Path to the gauges CSV
+BASE_PATH = Path(os.environ.get("OneDrive", ""))
+if not BASE_PATH:
+    raise EnvironmentError("OneDrive environment variable not found")
+GAUGES_CSV = BASE_PATH / 'classmaterials' / 'BLab_research_data' / 'Beth research data' / 'Gauges.csv' 
  
 # Buffer radius in metres around the gauge point
 BUFFER_RADIUS_M = 1000  # 1 km — matches GEE logic
