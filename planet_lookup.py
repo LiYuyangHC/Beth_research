@@ -119,20 +119,18 @@ def search_payload(geom):
 
 def yield_features(url, auth, payload):
     page = requests.post(url, auth=auth, data=json.dumps(payload), headers=headers)
-    if response.status_code == 200:
+    if page.status_code == 200:
         if page.json()['features']:
             for feature in page.json()['features']:
                 yield feature
 
             while True:
-                url = page.json()['_links']['_next']
-                page = requests.get(url, auth=auth)
-
+                next_url = page.json()['_links'].get('_next')
+                if next_url is None:
+                    break
+                page = requests.get(next_url, auth=auth)
                 for feature in page.json()['features']:
                     yield feature
-
-                if page.json()['_links'].get('_next') is None:
-                    break
 
 
 def ft_iterate(geom):
