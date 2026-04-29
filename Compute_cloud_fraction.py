@@ -12,11 +12,18 @@ Mirrors the GEE logic from GEE_L89_gaugeexport_cc.txt:
 Output CSV columns match GEE export:
   time, cloud_fraction_1km, satellite, image_id, scene_path
 
+Planet download folder structure:
+  download_path/gauge_1/batch_id/PSScene/
+    ├── 20260101_164834_10_24f6_3B_AnalyticMS_SR_clip.tif
+    ├── 20260101_164834_10_24f6_3B_udm2_clip.tif
+    ├── 20260101_164834_10_24f6_metadata.json
+    └── ...
+
 Run after downloading images:
     python compute_cloud_fraction.py
 
-Requires: rasterio, numpy, pandas, shapely, geopandas
-    pip install rasterio numpy pandas shapely geopandas
+Requires: rasterio, numpy, pandas, shapely
+    pip install rasterio numpy pandas shapely
 """
 
 import json
@@ -43,29 +50,21 @@ def load_aoi_geometry():
 
 
 def compute_cloud_fraction_for_scene(udm2_path: Path, aoi_geom) -> float:
-    """
-    Returns fraction of pixels flagged as shadow, cloud, or cirrus/haze
-    within the AOI. Returns NaN if the file cannot be read.
-    """
     try:
         with rasterio.open(udm2_path) as src:
-            def masked(band):
-                data, _ = rasterio.mask.mask(
-                    src, [aoi_geom.__geo_interface__],
-                    crop=True, indexes=band, nodata=255
-                )
-                return data
+            shadow = src.read(3)
+            cloud  = src.read(6)
+            cirrus = src.read(5)  # heavy haze
+            clear  = src.read(1)
 
-            shadow = masked(UDM2_SHADOW_BAND)
-            cloud  = masked(UDM2_CLOUD_BAND)
-            cirrus = masked(UDM2_CIRRUS_BAND)
-
-        valid = shadow != 255
+        # Valid = any pixel that has data (clear=1 OR any flag set)
+        # Exclude pixels where all bands are 0 (no data)
+        valid = (clear == 1) | (shadow == 1) | (cloud == 1) | (cirrus == 1)
         n_valid = valid.sum()
         if n_valid == 0:
             return float('nan')
 
-        cloudy = ((shadow == 1) | (cloud == 1) | (cirrus == 1)) & valid
+        cloudy = (shadow == 1) | (cloud == 1) | (cirrus == 1)
         return float(cloudy.sum()) / float(n_valid)
 
     except Exception as e:
@@ -73,44 +72,78 @@ def compute_cloud_fraction_for_scene(udm2_path: Path, aoi_geom) -> float:
         return float('nan')
 
 
-def parse_scene_metadata(scene_dir: Path):
-    """Extract acquisition time and satellite ID from Planet metadata JSON."""
-    meta_files = list(scene_dir.glob('*_metadata.json'))
-    if not meta_files:
-        return None, None
-    with open(meta_files[0]) as f:
-        meta = json.load(f)
-    props = meta.get('properties', {})
-    acquired = props.get('acquired', '')[:19].replace('T', ' ')
-    satellite = props.get('satellite_id', 'unknown')
-    return acquired, satellite
+def find_psscene_folders(download_dir: Path):
+    """
+    Find all PSScene folders within the download directory.
+    Planet structure: download_path / gauge_id / batch_id / PSScene / *.tif
+    """
+    return sorted(download_dir.rglob('PSScene'))
+
+
+def extract_scene_id(filename: str) -> str:
+    """
+    Extract scene ID from Planet filename.
+    e.g. '20260101_164834_10_24f6_3B_udm2_clip.tif' → '20260101_164834_10_24f6'
+    """
+    parts = filename.split('_')
+    if len(parts) >= 4:
+        return '_'.join(parts[:4])
+    return filename
 
 
 def run():
     download_dir = Path(cfg.download_path)
     aoi_geom = load_aoi_geometry()
 
-    scene_dirs = sorted([d for d in download_dir.iterdir() if d.is_dir()])
-    print(f"[cloud_fraction] Found {len(scene_dirs)} scene folders in {download_dir}")
+    # Find all PSScene folders
+    psscene_dirs = find_psscene_folders(download_dir)
+    if not psscene_dirs:
+        print(f"[cloud_fraction] No PSScene folders found in {download_dir}")
+        print(f"  Check that images have been downloaded.")
+        return
+
+    # Collect all UDM2 files across all PSScene folders
+    udm2_files = []
+    for ps_dir in psscene_dirs:
+        udm2_files.extend(sorted(ps_dir.glob('*_udm2_clip.tif')))
+
+    print(f"[cloud_fraction] Found {len(udm2_files)} UDM2 files across "
+          f"{len(psscene_dirs)} PSScene folder(s)")
 
     records = []
-    for scene_dir in scene_dirs:
-        scene_id = scene_dir.name
-        udm2_files = list(scene_dir.glob('*_udm2.tif'))
-        if not udm2_files:
-            print(f"  [SKIP] No UDM2 found in {scene_id}")
-            continue
+    for udm2_path in udm2_files:
+        scene_id = extract_scene_id(udm2_path.name)
+        ps_dir = udm2_path.parent
 
-        cf = compute_cloud_fraction_for_scene(udm2_files[0], aoi_geom)
-        time_str, satellite = parse_scene_metadata(scene_dir)
+        # Compute cloud fraction
+        cf = compute_cloud_fraction_for_scene(udm2_path, aoi_geom)
+
+        # Find matching metadata JSON
+        meta_files = list(ps_dir.glob(f'{scene_id}_metadata.json'))
+        time_str, satellite = None, None
+        if meta_files:
+            try:
+                with open(meta_files[0]) as f:
+                    meta = json.load(f)
+                props = meta.get('properties', {})
+                time_str = props.get('acquired', '')[:19].replace('T', ' ')
+                satellite = props.get('satellite_id', 'unknown')
+            except Exception as e:
+                print(f"  [WARN] Could not read metadata for {scene_id}: {e}")
 
         records.append({
             'time':               time_str,
             'cloud_fraction_1km': round(cf, 6) if not np.isnan(cf) else '',
             'satellite':          satellite,
             'image_id':           scene_id,
-            'scene_path':         str(scene_dir)
+            'scene_path':         str(ps_dir)
         })
+
+        # Progress
+        if not np.isnan(cf):
+            print(f"  {scene_id}: cloud_fraction={cf:.3f}")
+        else:
+            print(f"  {scene_id}: cloud_fraction=NaN")
 
     # ── Save CSV ──────────────────────────────────────────
     out_dir = Path(cfg.metadata_path)
