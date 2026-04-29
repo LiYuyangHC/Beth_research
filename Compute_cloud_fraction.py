@@ -51,20 +51,30 @@ def load_aoi_geometry():
 
 def compute_cloud_fraction_for_scene(udm2_path: Path, aoi_geom) -> float:
     try:
+        # Find matching SR image
+        sr_files = list(udm2_path.parent.glob(
+            udm2_path.name.replace('_udm2_clip.tif', '_AnalyticMS_SR_clip.tif')
+        ))
+        
         with rasterio.open(udm2_path) as src:
             shadow = src.read(3)
             cloud  = src.read(6)
-            cirrus = src.read(5)  # heavy haze
-            clear  = src.read(1)
 
-        # Valid = any pixel that has data (clear=1 OR any flag set)
-        # Exclude pixels where all bands are 0 (no data)
-        valid = (clear == 1) | (shadow == 1) | (cloud == 1) | (cirrus == 1)
+        # Use SR image to determine valid pixels (not blackfill corners)
+        if sr_files:
+            with rasterio.open(sr_files[0]) as sr_src:
+                sr_band = sr_src.read(1)
+            valid = (sr_band != 0)  # 0 = nodata corners in SR
+        else:
+            # Fallback: use Band 1 clear + cloud flags
+            clear = rasterio.open(udm2_path).read(1)
+            valid = (clear == 1) | (shadow == 1) | (cloud == 1)
+
         n_valid = valid.sum()
         if n_valid == 0:
             return float('nan')
 
-        cloudy = (shadow == 1) | (cloud == 1) | (cirrus == 1)
+        cloudy = ((shadow == 1) | (cloud == 1)) & valid
         return float(cloudy.sum()) / float(n_valid)
 
     except Exception as e:
