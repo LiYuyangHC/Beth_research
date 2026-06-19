@@ -31,8 +31,10 @@ import numpy as np
 import pandas as pd
 import rasterio
 import rasterio.mask
+from rasterio.warp import transform_geom
+from datetime import datetime
 from pathlib import Path
-from shapely.geometry import shape
+from shapely.geometry import mapping, shape
 
 import config as cfg
 
@@ -40,13 +42,38 @@ import config as cfg
 # Planet UDM2 band layout:
 #   1: clear  2: snow  3: shadow  4: light haze  5: heavy haze  6: cloud
 UDM2_SHADOW_BAND = 3
+UDM2_LIGHT_HAZE_BAND = 4
 UDM2_CLOUD_BAND  = 6
 UDM2_CIRRUS_BAND = 5  # heavy haze — closest to Landsat cirrus
+
+# Beth's Landsat code uses shadow + cloud + cirrus. Planet has heavy haze
+# rather than cirrus, so heavy haze is included by default as the closest
+# equivalent. Light haze is left off by default to stay closer to that logic;
+# set this to True for a stricter "any haze/cloud impairment" sensitivity test.
+INCLUDE_LIGHT_HAZE = True
 
 
 def load_aoi_geometry():
     with open(cfg.aoi_path) as f:
         return shape(json.load(f))
+
+
+def geometry_for_dataset(dataset, aoi_geom):
+    geom = mapping(aoi_geom)
+    if dataset.crs:
+        return transform_geom('EPSG:4326', dataset.crs, geom)
+    return geom
+
+
+def read_masked_band(dataset, aoi_geom, band_index: int, dataset_geom=None):
+    geom = dataset_geom or geometry_for_dataset(dataset, aoi_geom)
+    band = rasterio.mask.mask(
+        dataset, [geom], crop=True,
+        indexes=band_index, filled=True
+    )[0]
+    if band.ndim == 3:
+        return band[0]
+    return band
 
 
 def compute_cloud_fraction_for_scene(udm2_path: Path, aoi_geom) -> float:
@@ -57,24 +84,47 @@ def compute_cloud_fraction_for_scene(udm2_path: Path, aoi_geom) -> float:
         ))
         
         with rasterio.open(udm2_path) as src:
-            shadow = src.read(3)
-            cloud  = src.read(6)
+            udm2_geom = geometry_for_dataset(src, aoi_geom)
+            shadow = read_masked_band(
+                src, aoi_geom, UDM2_SHADOW_BAND, dataset_geom=udm2_geom
+            )
+            cirrus = read_masked_band(
+                src, aoi_geom, UDM2_CIRRUS_BAND, dataset_geom=udm2_geom
+            )
+            light_haze = read_masked_band(
+                src, aoi_geom, UDM2_LIGHT_HAZE_BAND, dataset_geom=udm2_geom
+            )
+            cloud = read_masked_band(
+                src, aoi_geom, UDM2_CLOUD_BAND, dataset_geom=udm2_geom
+            )
 
         # Use SR image to determine valid pixels (not blackfill corners)
         if sr_files:
             with rasterio.open(sr_files[0]) as sr_src:
-                sr_band = sr_src.read(1)
+                sr_geom = geometry_for_dataset(sr_src, aoi_geom)
+                sr_band = read_masked_band(
+                    sr_src, aoi_geom, 1, dataset_geom=sr_geom
+                )
             valid = (sr_band != 0)  # 0 = nodata corners in SR
         else:
             # Fallback: use Band 1 clear + cloud flags
-            clear = rasterio.open(udm2_path).read(1)
-            valid = (clear == 1) | (shadow == 1) | (cloud == 1)
+            with rasterio.open(udm2_path) as src:
+                udm2_geom = geometry_for_dataset(src, aoi_geom)
+                clear = read_masked_band(
+                    src, aoi_geom, 1, dataset_geom=udm2_geom
+                )
+            valid = (clear == 1) | (shadow == 1) | (cirrus == 1) | (cloud == 1)
+            if INCLUDE_LIGHT_HAZE:
+                valid = valid | (light_haze == 1)
 
         n_valid = valid.sum()
         if n_valid == 0:
             return float('nan')
 
-        cloudy = ((shadow == 1) | (cloud == 1)) & valid
+        cloudy = (shadow == 1) | (cirrus == 1) | (cloud == 1)
+        if INCLUDE_LIGHT_HAZE:
+            cloudy = cloudy | (light_haze == 1)
+        cloudy = cloudy & valid
         return float(cloudy.sum()) / float(n_valid)
 
     except Exception as e:
@@ -95,10 +145,66 @@ def extract_scene_id(filename: str) -> str:
     Extract scene ID from Planet filename.
     e.g. '20260101_164834_10_24f6_3B_udm2_clip.tif' → '20260101_164834_10_24f6'
     """
-    parts = filename.split('_')
-    if len(parts) >= 4:
-        return '_'.join(parts[:4])
-    return filename
+    for suffix in (
+        '_3B_udm2_clip.tif',
+        '_udm2_clip.tif',
+        '_3B_udm2.tif',
+        '_udm2.tif',
+    ):
+        if filename.endswith(suffix):
+            return filename[:-len(suffix)]
+    return Path(filename).stem
+
+
+def parse_scene_id_time(scene_id: str) -> str | None:
+    """
+    Recover acquisition time from Planet scene IDs that start with
+    YYYYMMDD_HHMMSS.
+    """
+    parts = scene_id.split('_')
+    if len(parts) < 2:
+        return None
+    try:
+        return datetime.strptime(
+            f'{parts[0]}_{parts[1]}', '%Y%m%d_%H%M%S'
+        ).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
+
+
+def parse_scene_id_satellite(scene_id: str) -> str | None:
+    """Recover the satellite/platform token from the end of a scene ID."""
+    parts = scene_id.split('_')
+    if len(parts) >= 3:
+        return parts[-1]
+    return None
+
+
+def read_scene_metadata(ps_dir: Path, scene_id: str):
+    """Return acquisition time and satellite id for a scene."""
+    time_str = parse_scene_id_time(scene_id)
+    satellite = parse_scene_id_satellite(scene_id)
+
+    meta_files = list(ps_dir.glob(f'{scene_id}_metadata.json'))
+    if not meta_files:
+        meta_files = [
+            p for p in ps_dir.glob(f'{scene_id}*_metadata.json')
+            if 'AnalyticMS' not in p.name
+        ]
+
+    if meta_files:
+        try:
+            with open(meta_files[0]) as f:
+                meta = json.load(f)
+            props = meta.get('properties', {})
+            acquired = props.get('acquired')
+            if acquired:
+                time_str = acquired[:19].replace('T', ' ')
+            satellite = props.get('satellite_id') or satellite or 'unknown'
+        except Exception as e:
+            print(f"  [WARN] Could not read metadata for {scene_id}: {e}")
+
+    return time_str, satellite
 
 
 def run():
@@ -128,18 +234,9 @@ def run():
         # Compute cloud fraction
         cf = compute_cloud_fraction_for_scene(udm2_path, aoi_geom)
 
-        # Find matching metadata JSON
-        meta_files = list(ps_dir.glob(f'{scene_id}_metadata.json'))
-        time_str, satellite = None, None
-        if meta_files:
-            try:
-                with open(meta_files[0]) as f:
-                    meta = json.load(f)
-                props = meta.get('properties', {})
-                time_str = props.get('acquired', '')[:19].replace('T', ' ')
-                satellite = props.get('satellite_id', 'unknown')
-            except Exception as e:
-                print(f"  [WARN] Could not read metadata for {scene_id}: {e}")
+        # Find matching metadata JSON. If unavailable, fall back to the Planet
+        # scene ID so time and satellite are not left blank.
+        time_str, satellite = read_scene_metadata(ps_dir, scene_id)
 
         records.append({
             'time':               time_str,

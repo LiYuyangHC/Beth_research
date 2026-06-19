@@ -1,0 +1,100 @@
+
+//gauge 1
+var point = ee.Geometry.Point(-79.493889, 35.061111); // gauge location
+Map.setCenter(-79.493889, 35.061111, 13);
+
+// //gauge 2
+// var point = ee.Geometry.Point(-78.293611, 34.404444); // gauge location
+// Map.setCenter(-78.293611, 34.404444, 13);
+
+// //gauge 3
+// var point = ee.Geometry.Point(-78.548333, 34.095); // gauge location
+// Map.setCenter(-78.548333, 34.095, 13);
+
+// //gauge 4
+// var point = ee.Geometry.Point(-81.4069444444, 36.393333); // gauge location
+// Map.setCenter(-81.4069444444, 36.393333, 13);
+
+// //gauge 5
+// var point = ee.Geometry.Point(-82.405278, 35.653056); // gauge location
+// Map.setCenter(-82.405278, 35.653056, 13);
+
+//gauge 6
+// var point = ee.Geometry.Point(-83.618611, 35.1275); // gauge location
+// Map.setCenter(-83.618611, 35.1275, 13);
+
+// //gauge 7
+// var point = ee.Geometry.Point(-77.0255555556, 36.3708333333); // gauge location
+// Map.setCenter(-77.0255555556, 36.370833333, 13);
+
+// //gauge 8
+// var point = ee.Geometry.Point(-77.3727777778, 35.6166666667); // gauge location
+// Map.setCenter(-77.3727777778, 35.6166666667, 13);
+
+// //gauge 9
+// var point = ee.Geometry.Point(-78.6741666667, 35.8380555556); // gauge location
+// Map.setCenter(-78.6741666667, 35.8380555556, 13);
+
+// //gauge 10
+// var point = ee.Geometry.Point(-79.7825, 36.0977777778); // gauge location
+// Map.setCenter(-79.7825, 36.0977777778, 13);
+
+
+
+var buffer = point.buffer(1000); // 1 km buffer
+
+// Load Landsat 8 & 9 Surface Reflectance collections
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2");
+var l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2");
+var landsat = l8.merge(l9);
+
+// Date range
+var start = '2000-01-01';
+var end   = '2025-07-31';
+
+// Function to compute cloud fraction (shadow + cloud + cirrus)
+function addCloudFraction(image) {
+  var qa = image.select('QA_PIXEL');
+  
+  // Cloud, shadow, cirrus bits
+  var cloudMask = qa.bitwiseAnd(1 << 3) // shadow
+                  .or(qa.bitwiseAnd(1 << 5)) // cloud
+                  .or(qa.bitwiseAnd(1 << 7)); // cirrus
+  
+  // Fraction of pixels flagged as cloudy in buffer
+  var cloudFraction = cloudMask.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: buffer,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('QA_PIXEL');
+  
+  return image.set({
+    'time': image.date().format('YYYY-MM-dd HH:mm'),
+    'cloud_fraction_1km': cloudFraction,
+    'satellite': image.get('SPACECRAFT_ID'),
+    'id': image.id()
+  });
+}
+
+
+// Apply filters and mapping
+var results = landsat
+  .filterBounds(buffer)
+  .filterDate(start, end)
+  .map(addCloudFraction);
+
+// Convert to FeatureCollection for export
+var fc = results.map(function(img) {
+  return ee.Feature(point, img.toDictionary([
+    'time', 'cloud_fraction_1km', 'satellite', 'id'
+  ]));
+});
+
+print('Mean cloud cover (1km buffer)', fc);
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'Landsat_CloudFraction_1km_gauge1',
+  fileFormat: 'CSV'
+});
