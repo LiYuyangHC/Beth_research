@@ -21,6 +21,8 @@ import pathlib
 import numpy as np
 import argparse
 from shapely.geometry import shape, Polygon, mapping
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import *
 
 
@@ -40,7 +42,10 @@ def authenticate_order():
     if response.status_code == 200:
         print('Setup OK: API key valid')
     else:
-        print(f'Failed with response code {response.status_code}')
+        msg = response.text.strip()
+        raise RuntimeError(
+            f'Planet API key check failed with status {response.status_code}: {msg}'
+        )
 
     return PLANET_API_KEY, headers, response
 
@@ -60,12 +65,52 @@ def order_now(order_payload):
         if feature_check.status_code == 200:
             print(f"Order URL: {url}")
             return url
+        msg = feature_check.text.strip()
+        raise RuntimeError(
+            f'Planet order was accepted but status lookup failed with '
+            f'status {feature_check.status_code}: {msg}'
+        )
     else:
-        print(f'Failed with Exception code: {response.status_code}')
+        msg = response.text.strip()
+        raise RuntimeError(
+            f'Planet order failed with status {response.status_code}: {msg}'
+        )
 
 
-def download_results(order_url, folder, overwrite=False):
-    r = requests.get(order_url, auth=(PLANET_API_KEY, ""))
+def build_download_session():
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def download_file(session, url, path):
+    tmp_path = path.with_suffix(path.suffix + ".part")
+    with session.get(url, allow_redirects=True, stream=True, timeout=(20, 120)) as r:
+        r.raise_for_status()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+    os.replace(tmp_path, path)
+
+
+def download_results(order_url, folder, overwrite=False, session=None):
+    if session is None:
+        session = build_download_session()
+
+    r = session.get(order_url, auth=(PLANET_API_KEY, ""), timeout=(20, 120))
     if r.status_code == 200:
         response = r.json()
         results = response['_links']['results']
@@ -77,13 +122,13 @@ def download_results(order_url, folder, overwrite=False):
             path = pathlib.Path(os.path.join(folder, name))
             if overwrite or not path.exists():
                 print(f'  downloading {name}')
-                r = requests.get(url, allow_redirects=True)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                open(path, 'wb').write(r.content)
+                download_file(session, url, path)
+                time.sleep(0.2)
             else:
                 print(f'  already exists, skipping {name}')
     else:
-        print(f'Failed with response {r.status_code}')
+        msg = r.text.strip()
+        raise RuntimeError(f'Failed to read order results {r.status_code}: {msg}')
 
 
 def order_url(feature_id, ids, json_bound, batchid=0):
@@ -238,8 +283,9 @@ if __name__ == "__main__":
         left = list(set(list(url_dc.keys())) - set(dl_done))
 
         if len(left) > 0:
-            for i, link in enumerate(left):
-                download_results(url_dc[link], dl_path)
-                print(f'\tBatch {i} done. Time elapsed: {(time.time() - start) / 60:.2f} min')
+            with build_download_session() as session:
+                for i, link in enumerate(left):
+                    download_results(url_dc[link], dl_path, session=session)
+                    print(f'\tBatch {i} done. Time elapsed: {(time.time() - start) / 60:.2f} min')
         else:
             print('\tAll batches already downloaded.')

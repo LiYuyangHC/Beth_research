@@ -10,7 +10,7 @@ planet_password = 'xxxxxxxxxxxxxxxxxxxxxxxxx' #place your Planet password
 # ── Gauge site selection ────────────────────────────
 # Change GAUGE_ID to match a row in gauges.csv
 # Options: 'gauge1' through 'gauge10'
-GAUGE_ID = 'gauge2'
+GAUGE_ID = 'gauge'
  
 # Path to the gauges CSV
 BASE_PATH = Path(os.environ.get("OneDrive", ""))
@@ -39,7 +39,7 @@ ITEM_TYPE  = 'PSScene'
 ASSET_TYPE = 'ortho_analytic_4b_sr'   # Surface reflectance, 4-band
  
 # ── Output paths ────────────────────────────────────
-LOCAL_OUTPUT = Path(r"F:\Research_PhD\Beth_research")
+LOCAL_OUTPUT = Path(r"localpath to beth research")
  
 aoi_path      = str(LOCAL_OUTPUT / "data" / "aoi" / f"{GAUGE_ID}_1km_buffer.geojson")
 lookup_path   = str(LOCAL_OUTPUT / "output" / "lookup"   / run)

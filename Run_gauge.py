@@ -54,7 +54,7 @@ def run_step(label: str, cmd: list, abort_on_fail: bool = True):
 
 def main():
     print("\n" + "═"*60)
-    print("  Planet Gauge Image Extraction — Gauge 1 Test Run")
+    print("  Planet Gauge Image Extraction — {GAUGE_ID}")
     if args.dry_run:
         print("  MODE: DRY RUN (lookup only, no order placed)")
     print("═"*60)
